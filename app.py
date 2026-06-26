@@ -12,6 +12,7 @@ load_dotenv()
 
 import os
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+print(HF_API_TOKEN)
 
 
 def call_huggingface(prompt):
@@ -466,6 +467,65 @@ st.set_page_config(page_title="Garmin AI Coach")
 
 st.title("Garmin AI Coach")
 st.write("If you can see this, your Streamlit app is working.")
+
+###############################################
+# 📊 TRAINING PROGRESS DASHBOARD (Cumulative + Weekly)
+###############################################
+
+st.header("📊 Training Progress Dashboard")
+
+if st.button("Show Training Progress"):
+    client = st.session_state["garmin_client"]
+
+    # Load data
+    plan_df = load_training_plan()
+    run_history_df = get_run_history(client, days=120)
+
+    if run_history_df.empty:
+        st.warning("No running history available.")
+        st.stop()
+
+    # --- Cumulative Comparison ---
+    comparison_df = get_comparison_dataframe(run_history_df, plan_df)
+
+    st.subheader("📈 Cumulative Mileage: Planned vs Actual")
+
+    chart_df = comparison_df[["date", "cumulative_planned", "cumulative_actual"]]
+    chart_df = chart_df.set_index("date")
+
+    st.line_chart(chart_df)
+
+    # --- Weekly Mileage ---
+    st.subheader("📅 Weekly Mileage Comparison")
+
+    weekly_trends = compute_weekly_trends(run_history_df, plan_df)
+
+    weekly_rows = []
+    for week, data in weekly_trends.items():
+        weekly_rows.append({
+            "Week": week,
+            "Planned Miles": data["planned_mileage"],
+            "Actual Miles": data["actual_mileage"],
+            "Difference": data["mileage_diff"]
+        })
+
+    weekly_df = pd.DataFrame(weekly_rows).sort_values("Week")
+
+    st.bar_chart(
+        weekly_df.set_index("Week")[["Planned Miles", "Actual Miles"]]
+    )
+
+    # --- Summary Stats ---
+    st.subheader("📌 Season Summary")
+
+    season_summary = get_season_summary(run_history_df, plan_df)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Miles Ran", season_summary["total_miles_ran"])
+    col2.metric("Plan Completion", f"{season_summary['total_completion_pct']}%")
+    col3.metric("Consistency", f"{season_summary['consistency_score']}%")
+    col4.metric("Miles Remaining", season_summary["remaining_miles_in_plan"])
+
 
 st.header("Recent Garmin activities")
 
