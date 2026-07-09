@@ -4,6 +4,8 @@ from datetime import date, timedelta
 import pandas as pd
 from datetime import datetime
 
+import altair as alt
+
 import requests
 import os
 
@@ -127,6 +129,107 @@ def get_run_history(client, days=90):
         })
 
     return pd.DataFrame(rows)
+
+def get_all_runs_with_splits(client, days=90):
+    """
+    Fetches all running activities for the last X days,
+    including splits/laps for each activity.
+    """
+    end = date.today()
+    start = end - timedelta(days=days)
+
+    activities = client.get_activities_by_date(start.isoformat(), end.isoformat())
+    if not activities:
+        return []
+
+    all_runs = []
+
+    for a in activities:
+        if a.get("activityType", {}).get("typeKey") != "running":
+            continue
+
+        activity_id = a.get("activityId")
+        splits_raw = get_laps(client, activity_id)
+
+        # Normalize Garmin lap formats
+        lap_list = []
+        if isinstance(splits_raw, dict):
+            lap_list = splits_raw.get("lapDTOs", [])
+        elif isinstance(splits_raw, list):
+            lap_list = splits_raw
+
+        # Convert laps to structured rows
+        laps = []
+        for lap in lap_list:
+            distance_mi = (lap.get("distance", 0) / 1609.34)
+            duration_min = (lap.get("duration", 0) / 60)
+            pace = (duration_min / distance_mi) if distance_mi > 0 else None
+
+            laps.append({
+                "lap": lap.get("lapNumber") or lap.get("lapIndex"),
+                "distance_mi": round(distance_mi, 2),
+                "duration_min": round(duration_min, 2),
+                "pace_min_per_mi": pace,
+                "avg_cadence": lap.get("averageRunCadence"),
+                "elev_gain": lap.get("elevationGain"),
+                "elev_loss": lap.get("elevationLoss"),
+            })
+
+        # Build run summary
+        distance_mi = (a.get("distance") or 0) / 1609.34
+        duration_min = (a.get("duration") or 0) / 60
+        pace = (duration_min / distance_mi) if distance_mi > 0 else None
+
+        run = {
+            "activity_id": activity_id,
+            "name": a.get("activityName"),
+            "date": str(a.get("startTimeLocal")),
+            "distance_mi": distance_mi,
+            "duration_min": duration_min,
+            "pace_min_per_mi": pace,
+            "avg_hr": a.get("averageHR"),
+            "max_hr": a.get("maxHR"),
+            "avg_cadence": a.get("averageRunningCadenceInStepsPerMinute"),
+            "splits": laps
+        }
+
+        all_runs.append(run)
+
+    return all_runs
+def compute_global_training_metrics(all_runs):
+    """
+    Computes season-wide metrics the conversational coach can use.
+    """
+    if not all_runs:
+        return {}
+
+    total_miles = sum(r["distance_mi"] for r in all_runs)
+    avg_pace = sum(r["pace_min_per_mi"] for r in all_runs if r["pace_min_per_mi"]) / len(all_runs)
+    avg_hr = sum(r["avg_hr"] for r in all_runs if r["avg_hr"]) / len(all_runs)
+
+    # Aerobic trend: compare first 20% vs last 20%
+    n = len(all_runs)
+    early = all_runs[:max(1, n // 5)]
+    late = all_runs[-max(1, n // 5):]
+
+    def avg_pace_hr(runs):
+        paces = [r["pace_min_per_mi"] for r in runs if r["pace_min_per_mi"]]
+        hrs = [r["avg_hr"] for r in runs if r["avg_hr"]]
+        if not paces or not hrs:
+            return None
+        return (sum(paces) / len(paces), sum(hrs) / len(hrs))
+
+    early_stats = avg_pace_hr(early)
+    late_stats = avg_pace_hr(late)
+
+    return {
+        "total_miles": round(total_miles, 1),
+        "avg_pace": round(avg_pace, 2),
+        "avg_hr": round(avg_hr, 1),
+        "early_period_stats": early_stats,
+        "late_period_stats": late_stats,
+        "num_runs": n
+    }
 
 def compute_weekly_trends(run_history_df, plan_df):
     # run_history_df: your logged Garmin runs
@@ -349,64 +452,120 @@ def compare_run_to_plan(latest_run, todays_plan, laps_df=None):
 
     return result
 
-def build_ai_input(latest_run, todays_plan, comparison, laps_df, weekly_trends, current_week_summary):
+
+def build_ai_input(latest_run, todays_plan, comparison, laps_df, weekly_trends, current_week_summary, all_runs, global_metrics, current_week_plan, next_week_plan):
+    latest_run_date = None
+    if latest_run and latest_run.get("start_time"):
+        latest_run_date = str(latest_run["start_time"])
+
+    today_date = str(datetime.today().date())
+
+    latest_run_is_today = (
+        latest_run_date is not None and today_date in latest_run_date
+    )
+
     return {
+        "today_date": today_date,
+        "latest_run_date": latest_run_date,
+        "latest_run_is_today": latest_run_is_today,
+
         "run_summary": latest_run,
         "todays_plan": todays_plan,
         "comparison": comparison,
         "laps": laps_df.to_dict("records") if laps_df is not None else None,
+
+        # FULL TRAINING HISTORY + SPLITS
+        "all_runs": all_runs,
+
+        # GLOBAL METRICS
+        "global_metrics": global_metrics,
+
+        # WEEKLY TRENDS
         "weekly_trends": weekly_trends,
-        "current_week": current_week_summary,
+        "current_week_summary": current_week_summary,
+
+        # EMPHASIZED PLANS
+        "current_week_plan": current_week_plan,
+        "next_week_plan": next_week_plan,
+
         "meta": {
             "race_goal": {
                 "race_name": "Half Marathon",
                 "race_date": "2026-09-06",
-                "target_pace_range": "9:15-9:40"
+                "target_pace_range": "9:15–9:40"
             }
         }
     }
 
+
 def build_coach_prompt(ai_input):
     return f"""
-You are an experienced running coach helping an 44 year old male runner train for a half marathon on 2026-09-06.
+You are an experienced running coach helping a 44-year-old male runner train for a half marathon on 2026-09-06.
 
-You are given:
-- Today's planned workout
-- The actual run data from Garmin
-- A comparison of planned vs actual
-- Lap data (if available)
-- Weekly trends
-- The current week's training plan
-- The next week's training plan
+===========================
+DATE CHECK (CRITICAL)
+===========================
+- Today is: {ai_input["today_date"]}
+- Latest run occurred on: {ai_input["latest_run_date"]}
+- Did the latest run occur today? {ai_input["latest_run_is_today"]}
 
+Before giving feedback:
+1. Determine whether the latest run happened today or earlier.
+2. If the latest run was NOT today, do NOT treat it as today's workout.
+3. Base all analysis on the correct temporal relationship.
+
+===========================
+FULL TRAINING HISTORY (last 90 days, including splits)
+===========================
+{ai_input["all_runs"]}
+
+===========================
+GLOBAL TRAINING METRICS
+===========================
+{ai_input["global_metrics"]}
+
+===========================
+HIGH-PRIORITY PLANS (emphasize these)
+===========================
 CURRENT WEEK PLAN:
-{ai_input.get("current_week_plan")}
+{ai_input["current_week_plan"]}
 
 NEXT WEEK PLAN:
-{ai_input.get("next_week_plan")}
+{ai_input["next_week_plan"]}
 
-RUN_SUMMARY:
-{ai_input["run_summary"]}
-
-TODAYS_PLAN:
+===========================
+SECONDARY CONTEXT
+===========================
+TODAY'S PLAN:
 {ai_input["todays_plan"]}
 
-COMPARISON:
+LATEST RUN SUMMARY:
+{ai_input["run_summary"]}
+
+PLAN VS ACTUAL COMPARISON:
 {ai_input["comparison"]}
 
-LAPS:
+LAPS (if available):
 {ai_input["laps"]}
 
-RACE_GOAL:
+WEEKLY TRENDS:
+{ai_input["weekly_trends"]}
+
+CURRENT WEEK SUMMARY:
+{ai_input["current_week_summary"]}
+
+RACE GOAL:
 {ai_input["meta"]["race_goal"]}
 
-Your job:
-- Evaluate how well today's run matched the plan
-- Comment on distance, pace, and effort
-- Consider how today's run affects the rest of THIS week
-- Consider how today's run affects NEXT week's training load
-- Give 2–3 specific, practical suggestions for upcoming runs
-- Keep the tone encouraging but honest, like a good coach
+===========================
+YOUR TASK
+===========================
+- Evaluate how well the latest run matched the plan *only if it occurred today*.
+- If the latest run was on a previous day, evaluate it as a past workout.
+- Consider splits, trends, global metrics, and plan alignment.
+- Emphasize the CURRENT WEEK PLAN and NEXT WEEK PLAN.
+- Provide 2–3 specific, practical suggestions for upcoming runs.
+- Keep the tone encouraging but honest.
 
 Respond with a single, coherent paragraph or two.
 """
@@ -505,16 +664,32 @@ if st.button("Show Training Progress"):
         weekly_rows.append({
             "Week": week,
             "Planned Miles": data["planned_mileage"],
-            "Actual Miles": data["actual_mileage"],
-            "Difference": data["mileage_diff"]
+            "Actual Miles": data["actual_mileage"]
         })
 
-    weekly_df = pd.DataFrame(weekly_rows).sort_values("Week")
+    weekly_df = pd.DataFrame(weekly_rows)
 
-    st.bar_chart(
-        weekly_df.set_index("Week")[["Planned Miles", "Actual Miles"]]
+    # Melt into long format for Altair
+    weekly_long = weekly_df.melt(
+        id_vars="Week",
+        value_vars=["Planned Miles", "Actual Miles"],
+        var_name="Type",
+        value_name="Miles"
     )
 
+    chart = (
+        alt.Chart(weekly_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("Week:O", title="Training Week"),
+            y=alt.Y("Miles:Q", title="Mileage"),
+            color=alt.Color("Type:N", title=""),
+            column=alt.Column("Type:N", title=None)  # side-by-side bars
+        )
+        .properties(height=300)
+    )
+
+    st.altair_chart(chart, use_container_width=True)
     # --- Summary Stats ---
     st.subheader("📌 Season Summary")
 
@@ -702,15 +877,21 @@ if st.button("Get AI LLM feedback"):
     next_training_week = current_training_week + 1
 
     current_week_plan = get_week_plan(plan_df, current_training_week).to_dict("records")
-    next_week_plan = get_week_plan(plan_df, next_training_week).to_dict("records")
 
     # Comparison
+    next_week_plan = get_week_plan(plan_df, next_training_week).to_dict("records")
     comparison = compare_run_to_plan(latest, todays_plan, laps_df)
 
     # Weekly trends
     run_history_df = get_run_history(client)
     weekly_trends = compute_weekly_trends(run_history_df, plan_df)
     current_week_summary = get_current_week_summary(weekly_trends)
+
+    # Full run history + splits
+    all_runs = get_all_runs_with_splits(client, days=90)
+
+    # Global metrics
+    global_metrics = compute_global_training_metrics(all_runs)
 
     # Build AI input
     ai_input = build_ai_input(
@@ -719,12 +900,12 @@ if st.button("Get AI LLM feedback"):
         comparison,
         laps_df,
         weekly_trends,
-        current_week_summary
+        current_week_summary,
+        all_runs,
+        global_metrics,
+        current_week_plan,
+        next_week_plan
     )
-
-    # Add week plans to AI input
-    ai_input["current_week_plan"] = current_week_plan
-    ai_input["next_week_plan"] = next_week_plan
 
     # Get feedback
     feedback = get_llm_coach_feedback(ai_input)
@@ -747,72 +928,154 @@ if "chat_messages" not in st.session_state:
 def build_chat_context():
     client = st.session_state["garmin_client"]
 
+    # Full run history + splits (last 90 days)
+    all_runs = get_all_runs_with_splits(client, days=90)
+
+    # Global metrics across the 90-day block
+    global_metrics = compute_global_training_metrics(all_runs)
+
+    # Full training plan
     plan_df = load_training_plan()
     todays_plan = get_todays_workout(plan_df)
-    run_history_df = get_run_history(client, days=60)
+
+    # Weekly trends from Garmin history
+    run_history_df = get_run_history(client, days=90)
     weekly_trends = compute_weekly_trends(run_history_df, plan_df)
-    current_week = get_current_week_summary(weekly_trends)
+    current_week_summary = get_current_week_summary(weekly_trends)
+
+    # Latest run summary
     latest = get_latest_run_summary(client)
 
-    # NEW: Determine current and next training week
+    # Date logic
+    today_date = str(datetime.today().date())
+    latest_run_date = None
+    if latest and latest.get("start_time"):
+        latest_run_date = str(latest["start_time"])
+
+    latest_run_is_today = (
+        latest_run_date is not None and today_date in latest_run_date
+    )
+
+    # Determine current and next training week
     today = datetime.today().date()
     current_training_week = get_training_week_number(plan_df, today)
     next_training_week = current_training_week + 1
 
-    # NEW: Extract week plans
+    # Extract week plans
     current_week_plan = get_week_plan(plan_df, current_training_week).to_dict("records")
     next_week_plan = get_week_plan(plan_df, next_training_week).to_dict("records")
 
     return {
-        "todays_plan": todays_plan,
+        "today_date": today_date,
+        "latest_run_date": latest_run_date,
+        "latest_run_is_today": latest_run_is_today,
+
+        # FULL TRAINING PLAN (for context)
         "training_plan": plan_df.to_dict("records"),
-        "run_history": run_history_df.to_dict("records"),
+
+        # FULL 90-DAY RUN HISTORY + SPLITS
+        "all_runs": all_runs,
+
+        # GLOBAL METRICS (season-wide)
+        "global_metrics": global_metrics,
+
+        # WEEKLY TRENDS (Garmin)
         "weekly_trends": weekly_trends,
-        "current_week": current_week,
+        "current_week_summary": current_week_summary,
+
+        # TODAY + LATEST RUN
+        "todays_plan": todays_plan,
         "latest_run": latest,
-        "current_week_plan": current_week_plan,   # NEW
-        "next_week_plan": next_week_plan,         # NEW
+
+        # EMPHASIZED PLANS
+        "current_week_plan": current_week_plan,
+        "next_week_plan": next_week_plan,
+
+        # RACE GOAL
         "race_goal": {
             "race_name": "Half Marathon",
             "race_date": "2026-09-06",
-            "target_pace_range": "9:15-9:40"
+            "target_pace_range": "9:15–9:40"
         }
     }
+
 
 
 # --- Build Prompt for Chat ---
 def build_chat_prompt(messages, context):
     return f"""
-You are Joel's personal running coach. Use the full context below to answer his questions.
+You are Joel's personal running coach. Use ALL training data below to answer his question accurately.
 
-TODAY'S PLAN:
-{context["todays_plan"]}
+===========================
+DATE CHECK (CRITICAL)
+===========================
+- Today is: {context["today_date"]}
+- Latest run occurred on: {context["latest_run_date"]}
+- Did the latest run occur today? {context["latest_run_is_today"]}
 
-LATEST RUN:
-{context["latest_run"]}
+Before answering:
+1. Determine whether the latest run happened today or earlier.
+2. If the latest run was NOT today, do NOT treat it as today's workout.
+3. Base all analysis on the correct temporal relationship.
 
+===========================
+FULL TRAINING PLAN (for context)
+===========================
+{context["training_plan"]}
+
+===========================
+FULL TRAINING HISTORY (last 90 days, including splits)
+===========================
+{context["all_runs"]}
+
+===========================
+GLOBAL TRAINING METRICS (last 90 days)
+===========================
+{context["global_metrics"]}
+
+===========================
+HIGH-PRIORITY PLANS (emphasize these)
+===========================
 CURRENT WEEK PLAN:
 {context["current_week_plan"]}
 
 NEXT WEEK PLAN:
 {context["next_week_plan"]}
 
+===========================
+SECONDARY CONTEXT
+===========================
+TODAY'S PLAN:
+{context["todays_plan"]}
+
+LATEST RUN:
+{context["latest_run"]}
+
 WEEKLY TRENDS:
 {context["weekly_trends"]}
 
 CURRENT WEEK SUMMARY:
-{context["current_week"]}
-
-RUN HISTORY (last 60 days):
-{context["run_history"]}
+{context["current_week_summary"]}
 
 RACE GOAL:
 {context["race_goal"]}
 
-CHAT HISTORY:
+===========================
+CHAT HISTORY
+===========================
 {messages}
 
-Now answer Joel's latest question as his coach. Be specific, practical, and forward-looking.
+===========================
+YOUR TASK
+===========================
+- Answer Joel's latest question using ALL available training data.
+- Consider splits, trends, global metrics, and plan alignment.
+- Emphasize the CURRENT WEEK PLAN and NEXT WEEK PLAN when giving advice.
+- If the latest run was not today, clearly state that before giving advice.
+- Provide specific, practical, forward-looking coaching guidance.
+- Keep the tone encouraging but honest.
+
+Respond with a single, coherent paragraph or two.
 """
 
 
